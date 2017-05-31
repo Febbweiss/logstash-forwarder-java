@@ -23,10 +23,12 @@ import info.fetter.logstashforwarder.util.RandomAccessFile;
 import java.io.File;
 import java.io.IOException;
 //import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
+import org.apache.commons.lang.ArrayUtils;
 
 import org.apache.log4j.Logger;
 
@@ -92,7 +94,7 @@ public class FileReader extends Reader {
 				} else {
 					pointer = readLines(state, spaceLeftInSpool);
 				}
-				numberOfEvents = eventList.size() - eventListSizeBefore; 
+				numberOfEvents = eventList.size() - eventListSizeBefore;
 			}
 		} catch(IOException e) {
 			logger.warn("Exception raised while reading file : " + state.getFile(), e);
@@ -105,7 +107,7 @@ public class FileReader extends Reader {
 		RandomAccessFile reader = state.getRandomAccessFile();
 		try {
 			for(byte[] magic : MAGICS) {
-				byte[] fileBytes = new byte[magic.length]; 
+				byte[] fileBytes = new byte[magic.length];
 				reader.seek(0);
 				int read = reader.read(fileBytes);
 				if (read != magic.length) {
@@ -122,21 +124,74 @@ public class FileReader extends Reader {
 		return false;
 	}
 
+	private static byte[] extractBytes(ByteBuffer byteBuffer)
+	{
+		byte[] bytes = new byte[byteBuffer.position()];
+		byteBuffer.rewind();
+		byteBuffer.get(bytes);
+		byteBuffer.clear();
+		return bytes;
+	}
+
 	private long readLines(FileState state, int spaceLeftInSpool) {
 		RandomAccessFile reader = state.getRandomAccessFile();
 		long pos = state.getPointer();
+		Multiline multiline = state.getMultiline();
 		try {
 			reader.seek(pos);
 			byte[] line = readLine(reader);
+			ByteBuffer bufferedLines = ByteBuffer.allocate(BYTEBUFFER_CAPACITY);
+			bufferedLines.clear();
 			while (line != null && spaceLeftInSpool > 0) {
 				if(logger.isTraceEnabled()) {
 					logger.trace("-- Read line : " + new String(line));
 					logger.trace("-- Space left in spool : " + spaceLeftInSpool);
 				}
 				pos = reader.getFilePointer();
-				addEvent(state, pos, line);
+				if (multiline == null) {
+					addEvent(state, pos, line);
+					spaceLeftInSpool--;
+				}
+				else {
+					if (logger.isTraceEnabled()) {
+						logger.trace("-- Multiline : " + multiline);
+						logger.trace("-- Multiline : matches " + multiline.isPatternFound(line));
+					}
+					if (multiline.isPatternFound(line)) {
+						// buffer the line
+						if (bufferedLines.position() > 0) {
+							bufferedLines.put(Multiline.JOINT);
+						}
+						bufferedLines.put(line);
+					}
+					else {
+						if (multiline.isPrevious()) {
+							// did not match, so new event started
+							if (bufferedLines.position() > 0) {
+								addEvent(state, pos, extractBytes(bufferedLines));
+								spaceLeftInSpool--;
+							}
+							bufferedLines.put(line);
+						}
+						else {
+							// did not match, add the current line
+							if (bufferedLines.position() > 0) {
+								bufferedLines.put(Multiline.JOINT);
+								bufferedLines.put(line);
+								addEvent(state, pos, extractBytes(bufferedLines));
+								spaceLeftInSpool--;
+							}
+							else {
+								addEvent(state, pos, line);
+								spaceLeftInSpool--;
+							}
+						}
+					}
+				}
 				line = readLine(reader);
-				spaceLeftInSpool--;
+			}
+			if (bufferedLines.position() > 0) {
+				addEvent(state, pos, extractBytes(bufferedLines)); // send any buffered lines left
 			}
 			reader.seek(pos); // Ensure we can re-read if necessary
 		} catch(IOException e) {
@@ -152,10 +207,7 @@ public class FileReader extends Reader {
 		while((ch=reader.read()) != -1) {
 			switch(ch) {
 			case '\n':
-				byte[] line = new byte[byteBuffer.position()];
-				byteBuffer.rewind();
-				byteBuffer.get(line);
-				return line;
+				return extractBytes(byteBuffer);
 			case '\r':
 				seenCR = true;
 				break;
